@@ -57,6 +57,7 @@ async function gh(env, path, options = {}) {
       "Accept": "application/vnd.github+json",
       "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
       "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "TangThu-News-Worker/1.0 (+https://tangthu.pages.dev)",
       ...(options.headers || {}),
     },
   });
