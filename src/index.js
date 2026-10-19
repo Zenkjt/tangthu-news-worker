@@ -47,7 +47,6 @@ function rateLimit(request, kind) {
 
 async function gh(env, path, options = {}) {
   if (!env.GITHUB_TOKEN) throw new Error("GITHUB_TOKEN chưa được cấu hình");
-
   const res = await fetch(`${GH_API}${path}`, {
     ...options,
     headers: {
@@ -58,7 +57,6 @@ async function gh(env, path, options = {}) {
       ...(options.headers || {}),
     },
   });
-
   if (!res.ok) {
     const body = await res.text();
     const error = new Error(`GitHub API ${res.status}: ${body.slice(0, 500)}`);
@@ -82,7 +80,7 @@ function htmlValue(html, regex) {
 }
 
 function decodeHtml(value) {
-  return value
+  return String(value || "")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
@@ -93,12 +91,11 @@ function decodeHtml(value) {
 }
 
 function repairMojibake(value) {
-  let text = String(value || "");
+  const text = String(value || "");
   if (!/[ÃÂ]/.test(text)) return text;
   try {
     const bytes = Uint8Array.from(text, ch => ch.charCodeAt(0) & 0xff);
-    const repaired = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return repaired;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     return text;
   }
@@ -106,10 +103,17 @@ function repairMojibake(value) {
 
 function cleanName(value, max = 60) {
   let text = repairMojibake(decodeHtml(String(value || "")))
+    .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   if (text.length > max) text = text.slice(0, max - 1).trimEnd() + "…";
   return text;
+}
+
+async function sourceId(url) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(url));
+  const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
+  return `s-${hash.slice(0, 12)}`;
 }
 
 function sourceNameFromHtml(html, url) {
@@ -117,36 +121,24 @@ function sourceNameFromHtml(html, url) {
     htmlValue(html, /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
     htmlValue(html, /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:site_name["'][^>]*>/i)
   );
-
-  const h1 = cleanName(
-    htmlValue(html, /<h1[^>]*>([\s\S]*?)<\/h1>/i).replace(/<[^>]+>/g, " "),
-    40
-  );
-
-  const title = cleanName(
-    htmlValue(html, /<title[^>]*>([\s\S]*?)<\/title>/i).replace(/<[^>]+>/g, " "),
-    60
-  );
-
+  const h1 = cleanName(htmlValue(html, /<h1[^>]*>([\s\S]*?)<\/h1>/i), 40);
+  const title = cleanName(htmlValue(html, /<title[^>]*>([\s\S]*?)<\/title>/i), 60);
   const host = new URL(url).hostname.replace(/^www\./i, "");
   const first = host.split(".")[0];
   const brand = first === "vnexpress"
     ? "VnExpress"
     : first.replace(/[-_]+/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-
   if (/\/chu-de\//i.test(new URL(url).pathname) && h1 && h1.length <= 40) {
     return cleanName(`${brand} — ${h1}`, 60);
   }
-
-  // Prefer a concise site name. Some sites put a full page title in og:site_name.
-  if (site && site.length <= 40 && !/^https?:\/\//i.test(site)) return site;
+  if (site && site.length <= 40 && !/^https?:\/\//i.test(site)) return cleanName(site, 60);
   return cleanName(brand || site || title || "Nguồn tin", 60);
 }
 
 async function discoverSource(url) {
   const res = await fetch(url, {
     headers: {
-      "User-Agent": "TangThuNewsWorker/1.0 (+https://tangthu.pages.dev)",
+      "User-Agent": "TangThu-News-Worker/1.0 (+https://tangthu.pages.dev)",
       "Accept": "text/html,application/xhtml+xml",
     },
     redirect: "follow",
@@ -154,7 +146,7 @@ async function discoverSource(url) {
   if (!res.ok) throw new Error(`Nguồn trả HTTP ${res.status}`);
   const html = await res.text();
   const finalUrl = normalizeUrl(res.url || url);
-  return { name: sourceNameFromHtml(html, finalUrl), url: finalUrl };
+  return { id: await sourceId(finalUrl), name: sourceNameFromHtml(html, finalUrl), url: finalUrl };
 }
 
 async function readJsonFile(env, path) {
@@ -162,128 +154,190 @@ async function readJsonFile(env, path) {
   const meta = await res.json();
   const content = atob(String(meta.content).replace(/\n/g, ""));
   const bytes = Uint8Array.from(content, ch => ch.charCodeAt(0));
-  return { sha: meta.sha, data: JSON.parse(new TextDecoder("utf-8").decode(bytes)) };
+  return {
+    sha: meta.sha,
+    data: JSON.parse(new TextDecoder("utf-8").decode(bytes)),
+  };
 }
 
-function base64Utf8(text) {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(binary);
+async function gitHead(env) {
+  const res = await gh(env, `/repos/${REPO}/git/ref/heads/main`);
+  return (await res.json()).object.sha;
 }
 
-async function writeJsonFile(env, path, data, sha, message) {
-  return gh(env, `/repos/${REPO}/contents/${path}`, {
-    method: "PUT",
+async function gitCommitTwoFiles(env, baseCommitSha, sourcesData, subsData, message) {
+  const commitRes = await gh(env, `/repos/${REPO}/git/commits/${baseCommitSha}`);
+  const commit = await commitRes.json();
+
+  const treeRes = await gh(env, `/repos/${REPO}/git/trees`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      base_tree: commit.tree.sha,
+      tree: [
+        {
+          path: SOURCES_PATH,
+          mode: "100644",
+          type: "blob",
+          content: JSON.stringify(sourcesData, null, 2) + "\n",
+        },
+        {
+          path: SUBS_PATH,
+          mode: "100644",
+          type: "blob",
+          content: JSON.stringify(subsData, null, 2) + "\n",
+        },
+      ],
+    }),
+  });
+  const tree = await treeRes.json();
+  if (!tree.sha) throw new Error("Không tạo được Git tree");
+
+  const newCommitRes = await gh(env, `/repos/${REPO}/git/commits`, {
+    method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message,
-      content: base64Utf8(JSON.stringify(data, null, 2) + "\n"),
-      sha,
-      branch: "main",
+      tree: tree.sha,
+      parents: [baseCommitSha],
     }),
   });
-}
+  const newCommit = await newCommitRes.json();
+  if (!newCommit.sha) throw new Error("Không tạo được Git commit");
 
-async function mutateJsonFile(env, path, message, mutator) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const file = await readJsonFile(env, path);
-    const result = await mutator(file.data);
-    if (result && result.skipWrite) return result.value;
-    try {
-      await writeJsonFile(env, path, result.data, file.sha, message);
-      return result.value;
-    } catch (error) {
-      if (error.status !== 409 && error.status !== 422) throw error;
-      if (attempt === 3) throw new Error("Registry đang được cập nhật đồng thời, vui lòng thử lại.");
-    }
-  }
-  throw new Error("Không thể cập nhật registry");
-}
-
-async function addSource(env, body) {
-  const url = normalizeUrl(body.url);
-  const checked = await discoverSource(url);
-  return mutateJsonFile(env, SOURCES_PATH, `news: add source ${checked.name}`, async data => {
-    const sources = Array.isArray(data.sources) ? data.sources : [];
-    const existing = sources.find(s => {
-      try { return normalizeUrl(s.url) === checked.url; } catch { return false; }
-    });
-    if (existing) return { skipWrite: true, value: { added: false, exists: true, source: existing } };
-
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(checked.url));
-    const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
-    const source = {
-      id: `s-${hash.slice(0, 12)}`,
-      name: checked.name,
-      url: checked.url,
-      enabled: true,
-      order: sources.reduce((m, s) => Math.max(m, Number(s.order) || 0), 0) + 1,
-    };
-    sources.push(source);
-    return { data: { sources }, value: { added: true, exists: false, source } };
+  await gh(env, `/repos/${REPO}/git/refs/heads/main`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sha: newCommit.sha, force: false }),
   });
+  return newCommit.sha;
 }
 
-async function addSubscription(env, body) {
+async function buildRegistration(env, body) {
   const branchId = String(body.branch_id || "").trim();
-  const sourceId = String(body.source_id || "").trim();
-  const articleCount = Number(body.article_count);
-  const editionMode = body.edition_mode === "images" ? "images" : "text";
-  const totalArticles = Number(body.total_articles);
+  const mode = body.edition_mode === "images" ? "images" : "text";
+  const total = Number(body.total_articles);
+  const newSourcesInput = Array.isArray(body.new_sources) ? body.new_sources : [];
+  const selected = Array.isArray(body.subscriptions) ? body.subscriptions : [];
 
-  if (!branchId || !sourceId || !Number.isInteger(articleCount) || articleCount < 5 || articleCount > 25) {
-    throw new Error("Thông tin đăng ký không hợp lệ");
-  }
-  if (editionMode === "images" && Number.isFinite(totalArticles) && totalArticles > 100) {
-    throw new Error("Chế độ có hình chỉ cho tối đa 100 bài trong một bản tin");
-  }
-  if (editionMode === "text" && Number.isFinite(totalArticles) && totalArticles > 200) {
-    throw new Error("Chế độ chỉ chữ chỉ cho tối đa 200 bài trong một bản tin");
+  if (!branchId || !selected.length) throw new Error("Chưa chọn tủ sách hoặc nguồn tin");
+  if (!Number.isInteger(total) || total < 5 || total > 200) throw new Error("Tổng số bài không hợp lệ");
+  if (mode === "images" && total > 100) throw new Error("Chế độ có hình chỉ cho tối đa 100 bài");
+  if (selected.some(x => !x || !Number.isInteger(Number(x.article_count)) || Number(x.article_count) < 5 || Number(x.article_count) > 25)) {
+    throw new Error("Số bài mỗi nguồn phải từ 5 đến 25");
   }
 
-  const [branches, sources] = await Promise.all([
+  const [branchesFile, sourcesFile, subsFile] = await Promise.all([
     readJsonFile(env, BRANCHES_PATH),
     readJsonFile(env, SOURCES_PATH),
+    readJsonFile(env, SUBS_PATH),
   ]);
-  const branchList = Array.isArray(branches.data.branches) ? branches.data.branches : [];
-  const sourceList = Array.isArray(sources.data.sources) ? sources.data.sources : [];
-  const branch = branchList.find(b => b.id === branchId);
+
+  const branches = Array.isArray(branchesFile.data.branches) ? branchesFile.data.branches : [];
+  const sources = Array.isArray(sourcesFile.data.sources) ? sourcesFile.data.sources.slice() : [];
+  const subs = Array.isArray(subsFile.data.subscriptions) ? subsFile.data.subscriptions.slice() : [];
+  const branch = branches.find(b => b.id === branchId);
+
   if (!branch) throw new Error("Tủ sách không tồn tại, vui lòng tạo tủ");
-  if (branch.enabled === false || (branch.status && branch.status !== "active")) throw new Error("Tủ sách đang không hoạt động");
-  const source = sourceList.find(s => s.id === sourceId);
-  if (!source) throw new Error("Nguồn tin không tồn tại");
-  if (source.enabled === false) throw new Error("Nguồn tin đang bị tắt");
+  if (branch.enabled === false || (branch.status && branch.status !== "active")) {
+    throw new Error("Tủ sách đang không hoạt động");
+  }
+
+  const sourceMap = new Map(sources.map(s => [s.id, s]));
+  let nextOrder = sources.reduce((m, s) => Math.max(m, Number(s.order) || 0), 0) + 1;
+
+  for (const raw of newSourcesInput) {
+    const url = normalizeUrl(raw.url);
+    const id = await sourceId(url);
+    if (sourceMap.has(id)) continue;
+    const existingUrl = sources.find(s => {
+      try { return normalizeUrl(s.url) === url; } catch { return false; }
+    });
+    if (existingUrl) {
+      sourceMap.set(existingUrl.id, existingUrl);
+      continue;
+    }
+
+    const source = {
+      id,
+      name: cleanName(raw.name || new URL(url).hostname, 60) || "Nguồn tin",
+      url,
+      enabled: true,
+      order: nextOrder++,
+    };
+    sources.push(source);
+    sourceMap.set(source.id, source);
+  }
 
   const now = new Date().toISOString();
-  return mutateJsonFile(env, SUBS_PATH, `news: update subscription ${branchId}/${sourceId}`, async data => {
-    const subscriptions = Array.isArray(data.subscriptions) ? data.subscriptions : [];
-    const index = subscriptions.findIndex(s => s.branch_id === branchId && s.source_id === sourceId);
+  const resultSubs = [];
+
+  for (const item of selected) {
+    const sourceIdValue = String(item.source_id || "").trim();
+    const source = sourceMap.get(sourceIdValue);
+    if (!source) throw new Error(`Nguồn tin không tồn tại: ${sourceIdValue}`);
+    if (source.enabled === false) throw new Error(`Nguồn tin đang bị tắt: ${source.name}`);
+
+    const count = Number(item.article_count);
+    const index = subs.findIndex(s => s.branch_id === branchId && s.source_id === source.id);
     if (index >= 0) {
-      const item = subscriptions[index];
-      item.article_count = articleCount;
-      item.edition_mode = editionMode;
-      item.enabled = true;
-      item.updated_at = now;
-      return { data: { subscriptions }, value: { added: false, updated: true, subscription: item } };
+      const sub = {
+        ...subs[index],
+        article_count: count,
+        edition_mode: mode,
+        enabled: true,
+        updated_at: now,
+      };
+      subs[index] = sub;
+      resultSubs.push(sub);
+    } else {
+      const digest = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(`${branchId}:${source.id}`)
+      );
+      const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
+      const sub = {
+        id: `sub-${hash.slice(0, 12)}`,
+        branch_id: branchId,
+        source_id: source.id,
+        article_count: count,
+        edition_mode: mode,
+        enabled: true,
+        created_at: now,
+        updated_at: now,
+      };
+      subs.push(sub);
+      resultSubs.push(sub);
     }
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${branchId}:${sourceId}`));
-    const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
-    const item = {
-      id: `sub-${hash.slice(0, 12)}`,
-      branch_id: branchId,
-      source_id: sourceId,
-      article_count: articleCount,
-      edition_mode: editionMode,
-      enabled: true,
-      created_at: now,
-      updated_at: now,
-    };
-    subscriptions.push(item);
-    return { data: { subscriptions }, value: { added: true, updated: false, subscription: item } };
-  });
+  }
+
+  return { branch, sources, subs, resultSubs };
+}
+
+async function registerNews(env, body) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const head = await gitHead(env);
+      const state = await buildRegistration(env, body);
+      const committedSha = await gitCommitTwoFiles(
+        env,
+        head,
+        { sources: state.sources },
+        { subscriptions: state.subs },
+        `news: register ${state.branch.id}`
+      );
+      return {
+        branch_name: state.branch.display_name || state.branch.id,
+        sources: state.sources,
+        subscriptions: state.resultSubs,
+        commit: committedSha,
+      };
+    } catch (error) {
+      if ((error.status === 409 || error.status === 422) && attempt < 3) continue;
+      throw error;
+    }
+  }
+  throw new Error("Registry đang được cập nhật đồng thời, vui lòng thử lại.");
 }
 
 export default {
@@ -294,20 +348,22 @@ export default {
 
     const url = new URL(request.url);
     try {
-      if (url.pathname === "/" && request.method === "GET") return json({ ok: true, service: "Tàng Thư News Worker" }, 200, origin);
+      if (url.pathname === "/" && request.method === "GET") {
+        return json({ ok: true, service: "Tàng Thư News Worker", version: "v12" }, 200, origin);
+      }
+
       if (url.pathname === "/source/check" && request.method === "POST") {
         if (!rateLimit(request, "check")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
         const body = await request.json();
-        return json({ ok: true, source: await discoverSource(normalizeUrl(body.url)) }, 200, origin);
+        const source = await discoverSource(normalizeUrl(body.url));
+        return json({ ok: true, source }, 200, origin);
       }
-      if (url.pathname === "/source/add" && request.method === "POST") {
+
+      if (url.pathname === "/news/register" && request.method === "POST") {
         if (!rateLimit(request, "write")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
-        return json({ ok: true, source: await addSource(env, await request.json()) }, 200, origin);
+        return json({ ok: true, ...(await registerNews(env, await request.json())) }, 200, origin);
       }
-      if (url.pathname === "/subscription/add" && request.method === "POST") {
-        if (!rateLimit(request, "write")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
-        return json({ ok: true, result: await addSubscription(env, await request.json()) }, 200, origin);
-      }
+
       return json({ ok: false, error: "Not found" }, 404, origin);
     } catch (error) {
       const status = error.status === 404 ? 404 : 400;
