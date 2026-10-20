@@ -213,6 +213,126 @@ async function gitCommitTwoFiles(env, baseCommitSha, sourcesData, subsData, mess
   return newCommit.sha;
 }
 
+async function gitCommitFile(env, baseCommitSha, path, data, message) {
+  const commitRes = await gh(env, `/repos/${REPO}/git/commits/${baseCommitSha}`);
+  const commit = await commitRes.json();
+  const treeRes = await gh(env, `/repos/${REPO}/git/trees`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      base_tree: commit.tree.sha,
+      tree: [{ path, mode: "100644", type: "blob", content: JSON.stringify(data, null, 2) + "\n" }],
+    }),
+  });
+  const tree = await treeRes.json();
+  if (!tree.sha) throw new Error("Không tạo được Git tree");
+  const newCommitRes = await gh(env, `/repos/${REPO}/git/commits`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, tree: tree.sha, parents: [baseCommitSha] }),
+  });
+  const newCommit = await newCommitRes.json();
+  if (!newCommit.sha) throw new Error("Không tạo được Git commit");
+  await gh(env, `/repos/${REPO}/git/refs/heads/main`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sha: newCommit.sha, force: false }),
+  });
+  return newCommit.sha;
+}
+
+async function addSource(env, body) {
+  const source = await discoverSource(normalizeUrl(body.url));
+  const url = source.url;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const head = await gitHead(env);
+      const file = await readJsonFile(env, SOURCES_PATH);
+      const sources = Array.isArray(file.data.sources) ? file.data.sources.slice() : [];
+      const existing = sources.find(s => {
+        try { return normalizeUrl(s.url) === url; } catch { return false; }
+      });
+      if (existing) return { source: existing, added: false, exists: true };
+      const nextOrder = sources.reduce((m, s) => Math.max(m, Number(s.order) || 0), 0) + 1;
+      const record = {
+        id: source.id,
+        name: url,
+        url,
+        enabled: true,
+        order: nextOrder,
+      };
+      sources.push(record);
+      const commit = await gitCommitFile(env, head, SOURCES_PATH, { sources }, `news: add source ${url}`);
+      return { source: record, added: true, exists: false, commit };
+    } catch (error) {
+      if ((error.status === 409 || error.status === 422) && attempt < 3) continue;
+      throw error;
+    }
+  }
+  throw new Error("Registry đang được cập nhật đồng thời, vui lòng thử lại.");
+}
+
+async function getNewsConfig(env) {
+  const [sourcesFile, subsFile] = await Promise.all([
+    readJsonFile(env, SOURCES_PATH),
+    readJsonFile(env, SUBS_PATH),
+  ]);
+  return {
+    sources: Array.isArray(sourcesFile.data.sources) ? sourcesFile.data.sources : [],
+    subscriptions: Array.isArray(subsFile.data.subscriptions) ? subsFile.data.subscriptions : [],
+  };
+}
+
+async function updateSubscription(env, body) {
+  const branchId = String(body.branch_id || "").trim();
+  const sourceIdValue = String(body.source_id || "").trim();
+  const action = body.action === "cancel" ? "cancel" : "save";
+  if (!branchId || !sourceIdValue) throw new Error("Thiếu tủ sách hoặc nguồn tin");
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const [head, branchesFile, sourcesFile, subsFile] = await Promise.all([
+        gitHead(env),
+        readJsonFile(env, BRANCHES_PATH),
+        readJsonFile(env, SOURCES_PATH),
+        readJsonFile(env, SUBS_PATH),
+      ]);
+      const branches = Array.isArray(branchesFile.data.branches) ? branchesFile.data.branches : [];
+      const sources = Array.isArray(sourcesFile.data.sources) ? sourcesFile.data.sources : [];
+      const subs = Array.isArray(subsFile.data.subscriptions) ? subsFile.data.subscriptions.slice() : [];
+      const branch = branches.find(b => b.id === branchId);
+      const source = sources.find(s => s.id === sourceIdValue);
+      if (!branch) throw new Error("Tủ sách không tồn tại, vui lòng tạo tủ");
+      if (!source) throw new Error("Nguồn tin không tồn tại");
+      if (branch.enabled === false || (branch.status && branch.status !== "active")) throw new Error("Tủ sách đang không hoạt động");
+      const index = subs.findIndex(s => s.branch_id === branchId && s.source_id === sourceIdValue);
+      const now = new Date().toISOString();
+      if (action === "cancel") {
+        if (index >= 0) {
+          subs[index] = { ...subs[index], enabled: false, updated_at: now };
+        }
+      } else {
+        const count = Number(body.article_count);
+        const mode = body.edition_mode === "images" ? "images" : "text";
+        if (!Number.isInteger(count) || count < 5 || count > 25) throw new Error("Số bài mỗi nguồn phải từ 5 đến 25");
+        if (index >= 0) {
+          subs[index] = { ...subs[index], article_count: count, edition_mode: mode, enabled: true, updated_at: now };
+        } else {
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${branchId}:${sourceIdValue}`));
+          const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
+          subs.push({ id: `sub-${hash.slice(0, 12)}`, branch_id: branchId, source_id: sourceIdValue, article_count: count, edition_mode: mode, enabled: true, created_at: now, updated_at: now });
+        }
+      }
+      const commit = await gitCommitFile(env, head, SUBS_PATH, { subscriptions: subs }, `news: ${action === "cancel" ? "cancel" : "update"} ${branchId}/${sourceIdValue}`);
+      return { branch_name: branch.display_name || branch.id, source: source, action, commit };
+    } catch (error) {
+      if ((error.status === 409 || error.status === 422) && attempt < 3) continue;
+      throw error;
+    }
+  }
+  throw new Error("Registry đang được cập nhật đồng thời, vui lòng thử lại.");
+}
+
 async function buildRegistration(env, body) {
   const branchId = String(body.branch_id || "").trim();
   const mode = body.edition_mode === "images" ? "images" : "text";
@@ -220,8 +340,9 @@ async function buildRegistration(env, body) {
   const newSourcesInput = Array.isArray(body.new_sources) ? body.new_sources : [];
   const selected = Array.isArray(body.subscriptions) ? body.subscriptions : [];
 
-  if (!branchId || !selected.length) throw new Error("Chưa chọn tủ sách hoặc nguồn tin");
-  if (!Number.isInteger(total) || total < 5 || total > 200) throw new Error("Tổng số bài không hợp lệ");
+  if (!branchId) throw new Error("Chưa chọn tủ sách");
+  if (!Number.isInteger(total) || total < 0 || total > 200) throw new Error("Tổng số bài không hợp lệ");
+  if (selected.length && total < 5) throw new Error("Tổng số bài không hợp lệ");
   if (mode === "images" && total > 100) throw new Error("Chế độ có hình chỉ cho tối đa 100 bài");
   if (selected.some(x => !x || !Number.isInteger(Number(x.article_count)) || Number(x.article_count) < 5 || Number(x.article_count) > 25)) {
     throw new Error("Số bài mỗi nguồn phải từ 5 đến 25");
@@ -271,6 +392,13 @@ async function buildRegistration(env, body) {
 
   const now = new Date().toISOString();
   const resultSubs = [];
+  const selectedIds = new Set(selected.map(item => String(item.source_id || "").trim()));
+
+  for (let i = 0; i < subs.length; i++) {
+    if (subs[i].branch_id === branchId && subs[i].enabled !== false && !selectedIds.has(subs[i].source_id)) {
+      subs[i] = { ...subs[i], enabled: false, updated_at: now };
+    }
+  }
 
   for (const item of selected) {
     const sourceIdValue = String(item.source_id || "").trim();
@@ -349,14 +477,30 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/" && request.method === "GET") {
-        return json({ ok: true, service: "Tàng Thư News Worker", version: "v12" }, 200, origin);
+        return json({ ok: true, service: "Tàng Thư News Worker", version: "v13" }, 200, origin);
       }
 
       if (url.pathname === "/source/check" && request.method === "POST") {
         if (!rateLimit(request, "check")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
         const body = await request.json();
         const source = await discoverSource(normalizeUrl(body.url));
+        source.name = source.url;
         return json({ ok: true, source }, 200, origin);
+      }
+
+      if (url.pathname === "/source/add" && request.method === "POST") {
+        if (!rateLimit(request, "write")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
+        return json({ ok: true, ...(await addSource(env, await request.json())) }, 200, origin);
+      }
+
+      if (url.pathname === "/news/config" && request.method === "GET") {
+        if (!rateLimit(request, "check")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
+        return json({ ok: true, ...(await getNewsConfig(env)) }, 200, origin);
+      }
+
+      if (url.pathname === "/subscription/update" && request.method === "POST") {
+        if (!rateLimit(request, "write")) return json({ ok: false, error: "Quá nhiều yêu cầu, vui lòng thử lại sau." }, 429, origin);
+        return json({ ok: true, ...(await updateSubscription(env, await request.json())) }, 200, origin);
       }
 
       if (url.pathname === "/news/register" && request.method === "POST") {
