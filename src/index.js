@@ -1,4 +1,6 @@
 const REPO = "Zenkjt/tangthu-opds";
+const CRAWLER_REPO = "Zenkjt/tangthu-news-crawler";
+const CRAWLER_EVENT = "news-subscription-changed";
 const SOURCES_PATH = "config/config_news_sources.json";
 const SUBS_PATH = "config/config_news_subscriptions.json";
 const BRANCHES_PATH = "config/branches.json";
@@ -168,43 +170,26 @@ async function gitHead(env) {
 async function gitCommitTwoFiles(env, baseCommitSha, sourcesData, subsData, message) {
   const commitRes = await gh(env, `/repos/${REPO}/git/commits/${baseCommitSha}`);
   const commit = await commitRes.json();
-
   const treeRes = await gh(env, `/repos/${REPO}/git/trees`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       base_tree: commit.tree.sha,
       tree: [
-        {
-          path: SOURCES_PATH,
-          mode: "100644",
-          type: "blob",
-          content: JSON.stringify(sourcesData, null, 2) + "\n",
-        },
-        {
-          path: SUBS_PATH,
-          mode: "100644",
-          type: "blob",
-          content: JSON.stringify(subsData, null, 2) + "\n",
-        },
+        { path: SOURCES_PATH, mode: "100644", type: "blob", content: JSON.stringify(sourcesData, null, 2) + "\n" },
+        { path: SUBS_PATH, mode: "100644", type: "blob", content: JSON.stringify(subsData, null, 2) + "\n" },
       ],
     }),
   });
   const tree = await treeRes.json();
   if (!tree.sha) throw new Error("Không tạo được Git tree");
-
   const newCommitRes = await gh(env, `/repos/${REPO}/git/commits`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      tree: tree.sha,
-      parents: [baseCommitSha],
-    }),
+    body: JSON.stringify({ message, tree: tree.sha, parents: [baseCommitSha] }),
   });
   const newCommit = await newCommitRes.json();
   if (!newCommit.sha) throw new Error("Không tạo được Git commit");
-
   await gh(env, `/repos/${REPO}/git/refs/heads/main`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -241,6 +226,19 @@ async function gitCommitFile(env, baseCommitSha, path, data, message) {
   return newCommit.sha;
 }
 
+async function dispatchCrawler(env, branchId) {
+  if (!branchId) return { dispatched: false, reason: "no_branch" };
+  await gh(env, `/repos/${CRAWLER_REPO}/dispatches`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      event_type: CRAWLER_EVENT,
+      client_payload: { mode: "on-demand", branch_id: branchId },
+    }),
+  });
+  return { dispatched: true, event: CRAWLER_EVENT, branch_id: branchId };
+}
+
 async function addSource(env, body) {
   const source = await discoverSource(normalizeUrl(body.url));
   const url = source.url;
@@ -254,13 +252,7 @@ async function addSource(env, body) {
       });
       if (existing) return { source: existing, added: false, exists: true };
       const nextOrder = sources.reduce((m, s) => Math.max(m, Number(s.order) || 0), 0) + 1;
-      const record = {
-        id: source.id,
-        name: url,
-        url,
-        enabled: true,
-        order: nextOrder,
-      };
+      const record = { id: source.id, name: url, url, enabled: true, order: nextOrder };
       sources.push(record);
       const commit = await gitCommitFile(env, head, SOURCES_PATH, { sources }, `news: add source ${url}`);
       return { source: record, added: true, exists: false, commit };
@@ -309,10 +301,9 @@ async function updateSubscription(env, body) {
       if (branch.enabled === false || (branch.status && branch.status !== "active")) throw new Error("Tủ sách đang không hoạt động");
       const index = subs.findIndex(s => s.branch_id === branchId && s.source_id === sourceIdValue);
       const now = new Date().toISOString();
+
       if (action === "cancel") {
-        if (index >= 0) {
-          subs[index] = { ...subs[index], enabled: false, updated_at: now };
-        }
+        if (index >= 0) subs[index] = { ...subs[index], enabled: false, updated_at: now };
       } else {
         const count = Number(body.article_count);
         const mode = body.edition_mode === "images" ? "images" : "text";
@@ -322,11 +313,33 @@ async function updateSubscription(env, body) {
         } else {
           const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${branchId}:${sourceIdValue}`));
           const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
-          subs.push({ id: `sub-${hash.slice(0, 12)}`, branch_id: branchId, source_id: sourceIdValue, article_count: count, edition_mode: mode, enabled: true, created_at: now, updated_at: now });
+          subs.push({
+            id: `sub-${hash.slice(0, 12)}`,
+            branch_id: branchId,
+            source_id: sourceIdValue,
+            article_count: count,
+            edition_mode: mode,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+          });
         }
       }
-      const commit = await gitCommitFile(env, head, SUBS_PATH, { subscriptions: subs }, `news: ${action === "cancel" ? "cancel" : "update"} ${branchId}/${sourceIdValue}`);
-      return { branch_name: branch.display_name || branch.id, source: source, action, commit };
+
+      const commit = await gitCommitFile(
+        env,
+        head,
+        SUBS_PATH,
+        { subscriptions: subs },
+        `news: ${action === "cancel" ? "cancel" : "update"} ${branchId}/${sourceIdValue}`
+      );
+
+      if (action === "cancel") {
+        return { branch_name: branch.display_name || branch.id, source, action, commit, dispatch: { dispatched: false, reason: "cancel" } };
+      }
+
+      const dispatch = await dispatchCrawler(env, branchId);
+      return { branch_name: branch.display_name || branch.id, source, action, commit, dispatch };
     } catch (error) {
       if ((error.status === 409 || error.status === 422) && attempt < 3) continue;
       throw error;
@@ -355,16 +368,13 @@ async function buildRegistration(env, body) {
     readJsonFile(env, SOURCES_PATH),
     readJsonFile(env, SUBS_PATH),
   ]);
-
   const branches = Array.isArray(branchesFile.data.branches) ? branchesFile.data.branches : [];
   const sources = Array.isArray(sourcesFile.data.sources) ? sourcesFile.data.sources.slice() : [];
   const subs = Array.isArray(subsFile.data.subscriptions) ? subsFile.data.subscriptions.slice() : [];
   const branch = branches.find(b => b.id === branchId);
 
   if (!branch) throw new Error("Tủ sách không tồn tại, vui lòng tạo tủ");
-  if (branch.enabled === false || (branch.status && branch.status !== "active")) {
-    throw new Error("Tủ sách đang không hoạt động");
-  }
+  if (branch.enabled === false || (branch.status && branch.status !== "active")) throw new Error("Tủ sách đang không hoạt động");
 
   const sourceMap = new Map(sources.map(s => [s.id, s]));
   let nextOrder = sources.reduce((m, s) => Math.max(m, Number(s.order) || 0), 0) + 1;
@@ -380,7 +390,6 @@ async function buildRegistration(env, body) {
       sourceMap.set(existingUrl.id, existingUrl);
       continue;
     }
-
     const source = {
       id,
       name: cleanName(raw.name || new URL(url).hostname, 60) || "Nguồn tin",
@@ -411,20 +420,11 @@ async function buildRegistration(env, body) {
     const count = Number(item.article_count);
     const index = subs.findIndex(s => s.branch_id === branchId && s.source_id === source.id);
     if (index >= 0) {
-      const sub = {
-        ...subs[index],
-        article_count: count,
-        edition_mode: mode,
-        enabled: true,
-        updated_at: now,
-      };
+      const sub = { ...subs[index], article_count: count, edition_mode: mode, enabled: true, updated_at: now };
       subs[index] = sub;
       resultSubs.push(sub);
     } else {
-      const digest = await crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(`${branchId}:${source.id}`)
-      );
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${branchId}:${source.id}`));
       const hash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
       const sub = {
         id: `sub-${hash.slice(0, 12)}`,
@@ -456,11 +456,15 @@ async function registerNews(env, body) {
         { subscriptions: state.subs },
         `news: register ${state.branch.id}`
       );
+      const dispatch = state.resultSubs.length
+        ? await dispatchCrawler(env, state.branch.id)
+        : { dispatched: false, reason: "no_active_subscriptions" };
       return {
         branch_name: state.branch.display_name || state.branch.id,
         sources: state.sources,
         subscriptions: state.resultSubs,
         commit: committedSha,
+        dispatch,
       };
     } catch (error) {
       if ((error.status === 409 || error.status === 422) && attempt < 3) continue;
@@ -479,7 +483,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/" && request.method === "GET") {
-        return json({ ok: true, service: "Tàng Thư News Worker", version: "v13" }, 200, origin);
+        return json({ ok: true, service: "Tàng Thư News Worker", version: "v14" }, 200, origin);
       }
 
       if (url.pathname === "/source/check" && request.method === "POST") {
