@@ -273,11 +273,13 @@ async function addSource(env, body) {
 }
 
 async function getNewsConfig(env) {
-  const [sourcesFile, subsFile] = await Promise.all([
+  const [branchesFile, sourcesFile, subsFile] = await Promise.all([
+    readJsonFile(env, BRANCHES_PATH),
     readJsonFile(env, SOURCES_PATH),
     readJsonFile(env, SUBS_PATH),
   ]);
   return {
+    branches: Array.isArray(branchesFile.data.branches) ? branchesFile.data.branches : [],
     sources: Array.isArray(sourcesFile.data.sources) ? sourcesFile.data.sources : [],
     subscriptions: Array.isArray(subsFile.data.subscriptions) ? subsFile.data.subscriptions : [],
   };
