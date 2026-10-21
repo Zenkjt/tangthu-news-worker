@@ -2,6 +2,9 @@
   "name": "tangthu-news-worker",
   "main": "src/index.js",
   "compatibility_date": "2026-10-19",
+  "triggers": {
+    "crons": ["45 3 * * *"]
+  },
   "vars": {
     "ALLOWED_ORIGIN": "https://tangthu.pages.dev"
   }
