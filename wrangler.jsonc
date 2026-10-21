@@ -3,7 +3,7 @@
   "main": "src/scheduler.js",
   "compatibility_date": "2026-10-19",
   "triggers": {
-    "crons": ["45 3 * * *"]
+    "crons": ["0 4 * * *"]
   },
   "vars": {
     "ALLOWED_ORIGIN": "https://tangthu.pages.dev"
